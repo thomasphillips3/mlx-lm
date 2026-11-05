@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import logging
+import os
 import pickle
 import platform
 import socket
@@ -559,6 +560,26 @@ class ResponseGenerator:
         except Exception as e:
             logging.exception(f"mlx_lm.server generation thread died: {e}")
             self._generation_failed = True
+            # There is no safe way to resume generation in this process: the
+            # exception may have left MLX/Metal state (e.g. after a GPU OOM)
+            # unusable, and simply spawning a replacement thread risks silently
+            # returning corrupt output rather than failing clearly. Once this
+            # flag is set, generation_available()/is_healthy report unhealthy
+            # forever and every /v1/chat/completions request starts failing
+            # immediately, but the HTTP server itself keeps listening and
+            # accepting connections -- from the outside it still looks like a
+            # live server. Exit the process instead, so a process supervisor
+            # (systemd, launchd, Docker --restart, Kubernetes, or a wrapper
+            # script polling GET /health) can detect the exit and restart a
+            # fresh instance, which is the only way to reliably recover.
+            logging.error(
+                "mlx_lm.server: generation is now unavailable in this process "
+                "and will not recover on its own. Exiting so a process "
+                "supervisor can restart the server; run mlx_lm.server under "
+                "one (systemd, launchd, Docker --restart, a health-polling "
+                "wrapper, etc.) for automatic recovery."
+            )
+            os._exit(1)
 
     def generation_available(self):
         return self._generation_thread.is_alive() and not self._generation_failed
